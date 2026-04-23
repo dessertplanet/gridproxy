@@ -64,6 +64,42 @@ local process_serial_data
 local grid_connect, grid_disconnect, grid_health_check
 local start_bridge, stop_bridge
 local health_tick
+local grid_lock, grid_unlock
+
+-- Saved original grid.connect for restore on bridge stop
+local _original_grid_connect = nil
+
+-- -------------------------------------------------------------------
+-- Grid lock: prevent scripts from stealing the grid while bridge is active
+-- -------------------------------------------------------------------
+
+local _dummy_grid = {
+  name = "gridproxy (locked)",
+  cols = 0,
+  rows = 0,
+  device = nil,
+  key = function() end,
+  led = function() end,
+  all = function() end,
+  refresh = function() end,
+  intensity = function() end,
+}
+
+grid_lock = function()
+  if _original_grid_connect then return end  -- already locked
+  _original_grid_connect = grid.connect
+  grid.connect = function(n)
+    -- return a dummy device so scripts don't error, but can't use the grid
+    return _dummy_grid
+  end
+end
+
+grid_unlock = function()
+  if _original_grid_connect then
+    grid.connect = _original_grid_connect
+    _original_grid_connect = nil
+  end
+end
 
 -- -------------------------------------------------------------------
 -- LED buffer
@@ -280,6 +316,9 @@ start_bridge = function()
   -- capture grid if already present
   grid_connect()
 
+  -- lock grid so scripts get a dummy device
+  grid_lock()
+
   -- health timer for grid hot-plug
   if not state.health_metro then
     state.health_metro = metro.init()
@@ -296,6 +335,9 @@ end
 stop_bridge = function()
   if not state.active then return end
   state.active = false
+
+  -- unlock grid so scripts can use it again
+  grid_unlock()
 
   if state.health_metro then
     state.health_metro:stop()
