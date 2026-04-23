@@ -34,6 +34,8 @@ local state = {
 
   -- bridge
   active    = false,    -- true when bridge is running
+  serial_connected = false,
+  serial_name = nil,
 
   -- LED buffer (device → grid): 16×16 max, 0–15 levels
   leds      = {},
@@ -44,6 +46,12 @@ local state = {
   -- health
   health_metro  = nil,
   health_rate   = 1.0,
+
+  -- debug counters (printed once/sec)
+  dbg_bytes = 0,
+  dbg_msgs = 0,
+  dbg_disc = 0,
+  dbg_level = 0,
 }
 
 -- Menu navigation
@@ -139,14 +147,19 @@ end
 process_serial_data = function(data)
   if not state.active or not state.decoder then return end
 
+  state.dbg_bytes = state.dbg_bytes + #data
+
   local messages = state.decoder:feed(data)
+  state.dbg_msgs = state.dbg_msgs + #messages
   local needs_refresh = false
 
   for _, msg in ipairs(messages) do
     if msg.type == mext.MSG_DISCOVERY_QUERY then
+      state.dbg_disc = state.dbg_disc + 1
       handle_discovery(msg.query)
 
     elseif msg.type == mext.MSG_LEVEL_MAP then
+      state.dbg_level = state.dbg_level + 1
       apply_level_map(msg)
       needs_refresh = true
 
@@ -238,14 +251,19 @@ start_bridge = function()
   serial.on_data = process_serial_data
 
   serial.on_connect = function()
-    print("gridproxy: serial connected — " .. (serial.device_name() or "?"))
+    state.serial_connected = true
+    state.serial_name = serial.device_name() or "?"
+    print("gridproxy: serial connected — " .. state.serial_name)
     state.decoder = mext.decoder()
     clear_leds()
     grid_connect()
+    mod.menu.redraw()
   end
 
   serial.on_disconnect = function()
     print("gridproxy: serial disconnected")
+    state.serial_connected = false
+    state.serial_name = nil
     state.decoder = mext.decoder()
     clear_leds()
     if state.grid_dev then
@@ -254,6 +272,7 @@ start_bridge = function()
         state.grid_dev:refresh()
       end)
     end
+    mod.menu.redraw()
   end
 
   -- register serial handler (auto-detects CDC ACM devices)
@@ -302,6 +321,16 @@ end
 
 health_tick = function()
   grid_health_check()
+
+  if state.active then
+    if state.dbg_bytes > 0 or state.dbg_msgs > 0 then
+      print(string.format("gridproxy: rx bytes=%d msgs=%d discovery=%d level_map=%d", state.dbg_bytes, state.dbg_msgs, state.dbg_disc, state.dbg_level))
+    end
+    state.dbg_bytes = 0
+    state.dbg_msgs = 0
+    state.dbg_disc = 0
+    state.dbg_level = 0
+  end
 end
 
 -- -------------------------------------------------------------------
@@ -351,8 +380,8 @@ m.redraw = function()
   -- serial status
   screen.level(7)
   screen.move(4, 42)
-  if serial.is_connected() then
-    screen.text("serial: " .. (serial.device_name() or "connected"))
+  if state.serial_connected then
+    screen.text("serial: " .. (state.serial_name or "connected"))
   else
     screen.text("serial: waiting for device...")
   end
