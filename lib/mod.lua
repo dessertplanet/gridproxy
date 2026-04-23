@@ -223,7 +223,9 @@ end
 -- -------------------------------------------------------------------
 
 grid_connect = function()
-  local g = grid.connect(1)
+  -- Always use the real grid.connect, even if we've monkeypatched it
+  local real_connect = _original_grid_connect or grid.connect
+  local g = real_connect(1)
   if not g then return end
 
   state.grid_dev = g
