@@ -1,111 +1,136 @@
---- serial.lua — Serial port abstraction for CDC ACM devices on norns.
+--- serial.lua — Serial transport using norns core/serial (matron native).
 --
--- Uses luaposix for non-blocking I/O.  CDC ACM ignores baud rate
--- but stty still requires one; the actual USB transfer rate is
--- determined by the host controller.
+-- Wraps norns' built-in serial handler API for CDC ACM devices.
+-- No luaposix required — matron handles open/close/termios natively.
+--
+-- The serial handler matches CDC ACM devices (Workshop Computer shows
+-- up as a "Pico" or CDC ACM device).  When connected, data arrives
+-- via the event callback and is buffered for the mod to consume.
 --
 -- Usage:
 --   local serial = require 'gridproxy/lib/serial'
---   local ports = serial.scan()
---   local port = serial.open(ports[1])
---   serial.write(port, "\x21\x03\x04")  -- mext key down
---   local data = serial.read(port)       -- non-blocking
---   serial.close(port)
+--   serial.on_connect = function() ... end
+--   serial.on_disconnect = function() ... end
+--   serial.on_data = function(data) ... end
+--   serial.setup()                   -- register handler
+--   serial.write(data)              -- send bytes
+--   serial.is_connected()           -- check state
 
-local unistd = require("posix.unistd")
-local fcntl  = require("posix.fcntl")
+local norns_serial = require 'core/serial'
 
 local serial = {}
 
---- Scan for available CDC ACM serial ports.
--- @return table Array of device paths (e.g. {"/dev/ttyACM0"})
-function serial.scan()
-  local ports = {}
-  local handle = io.popen("ls /dev/ttyACM* 2>/dev/null")
-  if handle then
-    for line in handle:lines() do
-      table.insert(ports, line)
-    end
-    handle:close()
-  end
-  return ports
+-- -------------------------------------------------------------------
+-- State
+-- -------------------------------------------------------------------
+
+local state = {
+  dev        = nil,    -- opaque device pointer from matron
+  dev_id     = nil,    -- device id string
+  dev_name   = nil,    -- device name
+  connected  = false,
+  setup_done = false,
+}
+
+-- -------------------------------------------------------------------
+-- Callbacks (set by mod.lua)
+-- -------------------------------------------------------------------
+
+serial.on_connect    = nil   -- function()
+serial.on_disconnect = nil   -- function()
+serial.on_data       = nil   -- function(data_string)
+
+-- -------------------------------------------------------------------
+-- Public API
+-- -------------------------------------------------------------------
+
+--- Register the serial handler with norns.
+-- Call once at mod startup. The handler auto-detects CDC ACM devices.
+function serial.setup()
+  if state.setup_done then return end
+  state.setup_done = true
+
+  norns_serial.add_handler({
+    id = "gridproxy",
+
+    match = function(attrs)
+      -- Match any CDC ACM device. The Workshop Computer / RP2040
+      -- typically shows as vendor "Raspberry_Pi" or similar.
+      -- CDC ACM devices that don't match other handlers will land here.
+      -- Accept all — the user selects which port via the mod menu.
+      --
+      -- For now, accept broad: any device that presents a serial port.
+      -- If this is too greedy, narrow to specific VID/PID later.
+      return true
+    end,
+
+    configure = function(term)
+      -- Raw binary mode: disable all processing
+      term.iflag = 0     -- no input processing
+      term.oflag = 0     -- no output processing
+      term.lflag = 0     -- no local flags (no echo, no canonical)
+      term.cflag = norns_serial.cflag.CS8
+                 + norns_serial.cflag.CREAD
+                 + norns_serial.cflag.CLOCAL
+      -- CDC ACM ignores baud rate, but set something reasonable
+      term.ispeed = norns_serial.speed.B115200
+      term.ospeed = norns_serial.speed.B115200
+      return term
+    end,
+
+    add = function(id, name, dev)
+      print("gridproxy/serial: device connected — " .. name .. " (id=" .. tostring(id) .. ")")
+      state.dev = dev
+      state.dev_id = id
+      state.dev_name = name
+      state.connected = true
+      if serial.on_connect then
+        serial.on_connect()
+      end
+    end,
+
+    remove = function(id)
+      if state.dev_id == id then
+        print("gridproxy/serial: device disconnected — " .. tostring(state.dev_name))
+        state.dev = nil
+        state.dev_id = nil
+        state.dev_name = nil
+        state.connected = false
+        if serial.on_disconnect then
+          serial.on_disconnect()
+        end
+      end
+    end,
+
+    event = function(id, data)
+      if state.dev_id == id and serial.on_data then
+        serial.on_data(data)
+      end
+    end,
+  })
 end
 
---- Open and configure a serial port for raw binary communication.
--- CDC ACM devices don't use hardware baud/parity, but the port
--- must be set to raw mode with no echo or line processing.
--- @param path string Device path (e.g. "/dev/ttyACM0")
--- @return table|nil Port handle, or nil on failure
-function serial.open(path)
-  -- configure: raw mode, no echo, no canonical processing
-  os.execute(string.format(
-    'stty -F "%s" 115200 raw -echo -echoe -echok -echoctl -echonl '
-    .. '-icanon -isig -iexten -opost -onlcr -icrnl -ixon -ixoff '
-    .. '2>/dev/null', path))
-
-  local fd = fcntl.open(path,
-    fcntl.O_RDWR + fcntl.O_NOCTTY + fcntl.O_NONBLOCK)
-
-  if not fd or fd < 0 then
-    print("gridproxy/serial: failed to open " .. path)
-    return nil
-  end
-
-  return {
-    fd = fd,
-    path = path,
-    connected = true,
-  }
-end
-
---- Write raw bytes to the port.
--- @param port table Port handle from serial.open()
--- @param data string Byte string to write
--- @return boolean true on success
-function serial.write(port, data)
-  if not port or not port.connected or port.fd < 0 then
+--- Write raw bytes to the connected serial device.
+-- @param data string Byte string to send
+-- @return boolean true if write was attempted
+function serial.write(data)
+  if not state.connected or not state.dev then
     return false
   end
-  local n, err = unistd.write(port.fd, data)
-  if not n then
-    print("gridproxy/serial: write error: " .. tostring(err))
-    port.connected = false
-    return false
-  end
+  norns_serial.send(state.dev, data)
   return true
 end
 
---- Non-blocking read from the port.
--- Returns immediately with whatever bytes are available, or nil
--- if none.  On a real error (not EAGAIN), marks the port disconnected.
--- @param port table Port handle from serial.open()
--- @param maxlen number Maximum bytes to read (default 256)
--- @return string|nil Data read, or nil if nothing available
-function serial.read(port, maxlen)
-  if not port or not port.connected or port.fd < 0 then
-    return nil
-  end
-  maxlen = maxlen or 256
-  local data, err = unistd.read(port.fd, maxlen)
-  if data and #data > 0 then
-    return data
-  end
-  -- nil or empty string: EAGAIN (no data) is normal with O_NONBLOCK
-  if err and err ~= "Resource temporarily unavailable" then
-    print("gridproxy/serial: read error: " .. tostring(err))
-    port.connected = false
-  end
-  return nil
+--- Check if a serial device is currently connected.
+-- @return boolean
+function serial.is_connected()
+  return state.connected
 end
 
---- Close the serial port.
--- @param port table Port handle from serial.open()
-function serial.close(port)
-  if port and port.fd >= 0 then
-    unistd.close(port.fd)
-    port.fd = -1
-    port.connected = false
-  end
+--- Get the connected device name (for display).
+-- @return string|nil
+function serial.device_name()
+  return state.dev_name
 end
 
 return serial

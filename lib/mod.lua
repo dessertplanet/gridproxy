@@ -4,13 +4,17 @@
 -- over CDC serial as mext messages, and relays LED data from the
 -- remote device back to the physical grid.
 --
+-- Uses norns' native serial API (matron) — no luaposix dependency.
+-- Serial device auto-connects when plugged in; the mod menu shows
+-- status and allows enabling/disabling the bridge.
+--
 -- Protocol detection: the Workshop Computer's device_mode_detect_protocol()
 -- waits up to 500ms for a first byte after CDC connects.  If no byte
 -- arrives, it defaults to mext mode.  This mod stays silent during that
 -- window, so no special handshake byte is needed.
 --
--- Install: copy the gridproxy/ folder to ~/dust/code/ on norns,
--- enable in SYSTEM > MODS, then restart.
+-- Install: ;install https://github.com/dessertplanet/gridproxy
+-- Then enable in SYSTEM > MODS and restart.
 
 local mod    = require 'core/mods'
 local serial = require 'gridproxy/lib/serial'
@@ -23,17 +27,13 @@ local m = {}
 -- -------------------------------------------------------------------
 
 local state = {
-  -- serial
-  ports     = {},       -- available serial port paths
-  port_idx  = 1,        -- selected port in menu list
-  port      = nil,      -- active serial connection (from serial.open)
-  port_path = nil,      -- path of the connected port (for reconnect)
-  enabled   = false,    -- true when user has activated the bridge
-
   -- grid
   grid_dev  = nil,      -- norns grid device
   grid_cols = 16,       -- discovered grid width
   grid_rows = 8,        -- discovered grid height
+
+  -- bridge
+  active    = false,    -- true when bridge is running
 
   -- LED buffer (device → grid): 16×16 max, 0–15 levels
   leds      = {},
@@ -41,41 +41,27 @@ local state = {
   -- mext decoder
   decoder   = nil,
 
-  -- polling
-  poll_metro   = nil,    -- serial read + LED refresh metro
-  poll_rate    = 0.004,  -- ~250 Hz serial poll (4 ms)
-
-  -- health / reconnect
-  health_metro    = nil,     -- slow timer for disconnect detection + reconnect
-  health_rate     = 1.0,     -- 1 Hz health check
-  read_count      = 0,       -- successful reads since last health tick
-  silent_ticks    = 0,       -- consecutive health ticks with no data
-  max_silent      = 10,      -- disconnect after 10s silence
-  reconnect_wait  = 0,       -- countdown ticks before reconnect attempt
-
-  -- discovery state
-  discovery_sent  = false,
-  connect_time    = 0,       -- os.clock() when serial was opened
+  -- health
+  health_metro  = nil,
+  health_rate   = 1.0,
 }
 
 -- Menu navigation
-local FOCUS_PORT   = 1
-local FOCUS_ACTION = 2
-local FOCUS_COUNT  = 2
+local FOCUS_ACTION = 1
+local FOCUS_COUNT  = 1
 local menu_focus   = 1
 
 -- -------------------------------------------------------------------
--- Forward declarations (Lua requires locals be declared before use)
+-- Forward declarations
 -- -------------------------------------------------------------------
 
 local clear_leds, set_led
 local on_grid_key
-local handle_discovery, apply_level_map, refresh_grid, poll_serial
+local handle_discovery, apply_level_map, refresh_grid
+local process_serial_data
 local grid_connect, grid_disconnect, grid_health_check
-local handle_serial_lost, health_tick
-local port_label, rescan
-local start_polling, stop_polling, start_health, stop_health
-local serial_connect, connect, disconnect
+local start_bridge, stop_bridge
+local health_tick
 
 -- -------------------------------------------------------------------
 -- LED buffer
@@ -102,10 +88,10 @@ end
 -- -------------------------------------------------------------------
 
 on_grid_key = function(x, y, z)
-  if not state.port or not state.port.connected then return end
+  if not serial.is_connected() then return end
   -- norns grid delivers 1-based coords; mext uses 0-based
   local msg = mext.encode_key(x - 1, y - 1, z)
-  serial.write(state.port, msg)
+  serial.write(msg)
 end
 
 -- -------------------------------------------------------------------
@@ -113,14 +99,14 @@ end
 -- -------------------------------------------------------------------
 
 handle_discovery = function(query_byte)
-  if not state.port or not state.port.connected then return end
+  if not serial.is_connected() then return end
 
   if query_byte == mext.SYS_QUERY then
-    serial.write(state.port, mext.encode_query_response())
+    serial.write(mext.encode_query_response())
   elseif query_byte == mext.SYS_ID then
-    serial.write(state.port, mext.encode_id("gridproxy"))
+    serial.write(mext.encode_id("gridproxy"))
   elseif query_byte == mext.SYS_SIZE_REQ then
-    serial.write(state.port, mext.encode_grid_size(state.grid_cols, state.grid_rows))
+    serial.write(mext.encode_grid_size(state.grid_cols, state.grid_rows))
   end
 end
 
@@ -147,176 +133,11 @@ refresh_grid = function()
 end
 
 -- -------------------------------------------------------------------
--- Polling / health timer helpers
+-- Process incoming serial data (called from serial event callback)
 -- -------------------------------------------------------------------
 
-start_polling = function()
-  if state.poll_metro then return end
-  state.poll_metro = metro.init()
-  state.poll_metro.time = state.poll_rate
-  state.poll_metro.event = function()
-    poll_serial()
-  end
-  state.poll_metro:start()
-end
-
-stop_polling = function()
-  if state.poll_metro then
-    state.poll_metro:stop()
-    state.poll_metro = nil
-  end
-end
-
-start_health = function()
-  if state.health_metro then return end
-  state.health_metro = metro.init()
-  state.health_metro.time = state.health_rate
-  state.health_metro.event = function()
-    health_tick()
-  end
-  state.health_metro:start()
-end
-
-stop_health = function()
-  if state.health_metro then
-    state.health_metro:stop()
-    state.health_metro = nil
-  end
-end
-
--- -------------------------------------------------------------------
--- Port helpers
--- -------------------------------------------------------------------
-
-port_label = function(path)
-  return path and (path:match("/dev/(.+)") or path) or "(none)"
-end
-
-rescan = function()
-  state.ports = serial.scan()
-  if state.port_idx > #state.ports then
-    state.port_idx = math.max(1, #state.ports)
-  end
-end
-
--- -------------------------------------------------------------------
--- Grid capture (with hot-plug re-attach)
--- -------------------------------------------------------------------
-
-grid_connect = function()
-  local g = grid.connect(1)
-  if not g then return end
-
-  state.grid_dev = g
-  state.grid_cols = g.cols or 16
-  state.grid_rows = g.rows or 8
-
-  g.key = function(x, y, z)
-    on_grid_key(x, y, z)
-  end
-
-  print("gridproxy: grid attached (" ..
-    state.grid_cols .. "x" .. state.grid_rows .. ")")
-end
-
-grid_disconnect = function()
-  if state.grid_dev then
-    pcall(function()
-      state.grid_dev:all(0)
-      state.grid_dev:refresh()
-    end)
-    state.grid_dev.key = nil
-    state.grid_dev = nil
-    print("gridproxy: grid detached")
-  end
-end
-
-grid_health_check = function()
-  if not state.enabled then return end
-
-  if state.grid_dev then
-    -- norns sets device.name to "none" when unplugged
-    if state.grid_dev.name == "none" or not state.grid_dev.device then
-      print("gridproxy: grid disappeared, releasing")
-      grid_disconnect()
-    end
-  end
-
-  if not state.grid_dev then
-    grid_connect()
-  end
-end
-
--- -------------------------------------------------------------------
--- Serial connection
--- -------------------------------------------------------------------
-
---- Open serial, init decoder, capture grid, start polling.
-serial_connect = function(path)
-  if state.port then return true end
-
-  state.port = serial.open(path)
-  if not state.port then
-    print("gridproxy: connection failed for " .. path)
-    return false
-  end
-
-  state.port_path = path
-  state.connect_time = os.clock()
-  state.read_count = 0
-  state.silent_ticks = 0
-  state.reconnect_wait = 0
-
-  print("gridproxy: serial connected to " .. path)
-
-  state.decoder = mext.decoder()
-  state.discovery_sent = false
-  clear_leds()
-
-  grid_connect()
-  start_polling()
-  start_health()
-  return true
-end
-
--- -------------------------------------------------------------------
--- Serial disconnect detection
--- -------------------------------------------------------------------
-
-handle_serial_lost = function()
-  stop_polling()
-  stop_health()
-
-  if state.port then
-    pcall(serial.close, state.port)
-    state.port = nil
-  end
-  state.decoder = nil
-
-  -- if still enabled, start health timer for reconnect attempts
-  if state.enabled then
-    state.reconnect_wait = 3
-    start_health()
-  end
-end
-
--- -------------------------------------------------------------------
--- Serial poll
--- -------------------------------------------------------------------
-
-poll_serial = function()
-  if not state.port or not state.port.connected then return end
-
-  local data = serial.read(state.port, 512)
-  if not data then
-    if state.port and not state.port.connected then
-      print("gridproxy: serial read error — port lost")
-      handle_serial_lost()
-    end
-    return
-  end
-
-  state.read_count = state.read_count + 1
+process_serial_data = function(data)
+  if not state.active or not state.decoder then return end
 
   local messages = state.decoder:feed(data)
   local needs_refresh = false
@@ -356,115 +177,148 @@ poll_serial = function()
 end
 
 -- -------------------------------------------------------------------
--- Health tick (1 Hz: silence detection, reconnect, grid hot-plug)
+-- Grid capture (with hot-plug re-attach)
+-- -------------------------------------------------------------------
+
+grid_connect = function()
+  local g = grid.connect(1)
+  if not g then return end
+
+  state.grid_dev = g
+  state.grid_cols = g.cols or 16
+  state.grid_rows = g.rows or 8
+
+  g.key = function(x, y, z)
+    on_grid_key(x, y, z)
+  end
+
+  print("gridproxy: grid attached (" ..
+    state.grid_cols .. "x" .. state.grid_rows .. ")")
+end
+
+grid_disconnect = function()
+  if state.grid_dev then
+    pcall(function()
+      state.grid_dev:all(0)
+      state.grid_dev:refresh()
+    end)
+    state.grid_dev.key = nil
+    state.grid_dev = nil
+    print("gridproxy: grid detached")
+  end
+end
+
+grid_health_check = function()
+  if not state.active then return end
+
+  if state.grid_dev then
+    if state.grid_dev.name == "none" or not state.grid_dev.device then
+      print("gridproxy: grid disappeared, releasing")
+      grid_disconnect()
+    end
+  end
+
+  if not state.grid_dev then
+    grid_connect()
+  end
+end
+
+-- -------------------------------------------------------------------
+-- Bridge start / stop
+-- -------------------------------------------------------------------
+
+start_bridge = function()
+  if state.active then return end
+  state.active = true
+
+  state.decoder = mext.decoder()
+  clear_leds()
+
+  -- wire up serial callbacks
+  serial.on_data = process_serial_data
+
+  serial.on_connect = function()
+    print("gridproxy: serial connected — " .. (serial.device_name() or "?"))
+    state.decoder = mext.decoder()
+    clear_leds()
+    grid_connect()
+  end
+
+  serial.on_disconnect = function()
+    print("gridproxy: serial disconnected")
+    state.decoder = mext.decoder()
+    clear_leds()
+    if state.grid_dev then
+      pcall(function()
+        state.grid_dev:all(0)
+        state.grid_dev:refresh()
+      end)
+    end
+  end
+
+  -- register serial handler (auto-detects CDC ACM devices)
+  serial.setup()
+
+  -- capture grid if already present
+  grid_connect()
+
+  -- health timer for grid hot-plug
+  if not state.health_metro then
+    state.health_metro = metro.init()
+    state.health_metro.time = state.health_rate
+    state.health_metro.event = function()
+      health_tick()
+    end
+    state.health_metro:start()
+  end
+
+  print("gridproxy: bridge started")
+end
+
+stop_bridge = function()
+  if not state.active then return end
+  state.active = false
+
+  if state.health_metro then
+    state.health_metro:stop()
+    state.health_metro = nil
+  end
+
+  grid_disconnect()
+  clear_leds()
+
+  serial.on_data = nil
+  serial.on_connect = nil
+  serial.on_disconnect = nil
+
+  state.decoder = nil
+
+  print("gridproxy: bridge stopped")
+end
+
+-- -------------------------------------------------------------------
+-- Health tick
 -- -------------------------------------------------------------------
 
 health_tick = function()
   grid_health_check()
-
-  if not state.enabled then return end
-
-  -- serial connected: check for silence / disconnect
-  if state.port then
-    if not state.port.connected then
-      print("gridproxy: serial port flagged disconnected")
-      handle_serial_lost()
-      return
-    end
-
-    if state.read_count == 0 then
-      state.silent_ticks = state.silent_ticks + 1
-    else
-      state.silent_ticks = 0
-    end
-    state.read_count = 0
-
-    -- don't consider silence in first 3s (device protocol detection window)
-    local elapsed = os.clock() - state.connect_time
-    if elapsed < 3.0 then
-      state.silent_ticks = 0
-    end
-
-    if state.silent_ticks > state.max_silent then
-      print("gridproxy: no data for " .. state.max_silent .. "s — assuming disconnect")
-      handle_serial_lost()
-    end
-    return
-  end
-
-  -- serial not connected: attempt reconnect
-  if state.reconnect_wait > 0 then
-    state.reconnect_wait = state.reconnect_wait - 1
-    return
-  end
-
-  if state.port_path then
-    local f = io.open(state.port_path, "r")
-    if f then
-      f:close()
-      serial_connect(state.port_path)
-    else
-      rescan()
-      state.reconnect_wait = 3
-    end
-  end
 end
 
 -- -------------------------------------------------------------------
--- User-facing connect / disconnect
--- -------------------------------------------------------------------
-
-connect = function()
-  if state.port then return end
-  if #state.ports == 0 or state.port_idx > #state.ports then return end
-
-  local path = state.ports[state.port_idx]
-  if serial_connect(path) then
-    state.enabled = true
-  end
-end
-
-disconnect = function()
-  state.enabled = false
-  stop_polling()
-  stop_health()
-  grid_disconnect()
-
-  if state.port then
-    print("gridproxy: disconnecting from " .. state.port.path)
-    serial.close(state.port)
-    state.port = nil
-  end
-
-  state.decoder = nil
-  state.discovery_sent = false
-  state.port_path = nil
-  state.silent_ticks = 0
-  state.read_count = 0
-  state.reconnect_wait = 0
-end
-
--- -------------------------------------------------------------------
--- Mod hooks
+-- Mod hooks — auto-start bridge when mod is loaded
 -- -------------------------------------------------------------------
 
 mod.hook.register("system_post_startup", "gridproxy", function()
-  rescan()
   clear_leds()
-  print("gridproxy: started, " .. #state.ports .. " port(s) found")
+  start_bridge()
 end)
 
 -- -------------------------------------------------------------------
 -- Mod menu page
 -- -------------------------------------------------------------------
 
-m.init = function()
-  rescan()
-end
-
-m.deinit = function()
-  -- keep connection alive when leaving menu
-end
+m.init = function() end
+m.deinit = function() end
 
 m.key = function(n, z)
   if z == 0 then return end
@@ -472,22 +326,13 @@ m.key = function(n, z)
   if n == 2 then
     mod.menu.exit()
   elseif n == 3 then
-    if menu_focus == FOCUS_PORT then
-      rescan()
-    elseif menu_focus == FOCUS_ACTION then
-      if state.port then disconnect() else connect() end
-    end
+    if state.active then stop_bridge() else start_bridge() end
+    mod.menu.redraw()
   end
 end
 
 m.enc = function(n, d)
-  if n == 2 then
-    menu_focus = util.clamp(menu_focus + d, 1, FOCUS_COUNT)
-  elseif n == 3 then
-    if menu_focus == FOCUS_PORT and not state.port then
-      state.port_idx = util.clamp(state.port_idx + d, 1, math.max(1, #state.ports))
-    end
-  end
+  -- single-item menu, nothing to scroll
 end
 
 m.redraw = function()
@@ -498,37 +343,26 @@ m.redraw = function()
   screen.move(64, 10)
   screen.text_center("GRIDPROXY")
 
-  -- port selection
-  local name = "(none)"
-  if #state.ports > 0 and state.port_idx <= #state.ports then
-    name = port_label(state.ports[state.port_idx])
-  end
-  screen.level(menu_focus == FOCUS_PORT and 15 or 4)
+  -- bridge toggle
+  screen.level(15)
   screen.move(4, 28)
-  screen.text("PORT: " .. name)
-  if #state.ports > 1 then
-    screen.move(124, 28)
-    screen.text_right(state.port_idx .. "/" .. #state.ports)
+  screen.text(state.active and "> STOP BRIDGE" or "> START BRIDGE")
+
+  -- serial status
+  screen.level(7)
+  screen.move(4, 42)
+  if serial.is_connected() then
+    screen.text("serial: " .. (serial.device_name() or "connected"))
+  else
+    screen.text("serial: waiting for device...")
   end
 
-  -- connect / disconnect button
-  screen.level(menu_focus == FOCUS_ACTION and 15 or 4)
-  screen.move(4, 40)
-  screen.text(state.port and "> DISCONNECT" or "> CONNECT")
-
-  -- status line
-  screen.level(7)
-  screen.move(4, 56)
-  if state.port and state.port.connected then
-    local grid_str = state.grid_dev and
-      (" | grid " .. state.grid_cols .. "x" .. state.grid_rows) or " | no grid"
-    screen.text("connected" .. grid_str)
-  elseif state.enabled and not state.port then
-    screen.text("reconnecting...")
-  elseif state.port then
-    screen.text("status: error")
+  -- grid status
+  screen.move(4, 52)
+  if state.grid_dev then
+    screen.text("grid: " .. state.grid_cols .. "x" .. state.grid_rows)
   else
-    screen.text("status: idle")
+    screen.text("grid: not connected")
   end
 
   screen.update()
