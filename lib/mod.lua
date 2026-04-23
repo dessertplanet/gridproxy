@@ -339,7 +339,8 @@ end
 
 mod.hook.register("system_post_startup", "gridproxy", function()
   clear_leds()
-  start_bridge()
+  -- stopped by default; user starts bridge from mod menu
+  serial.setup()
 end)
 
 -- -------------------------------------------------------------------
