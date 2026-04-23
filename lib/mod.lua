@@ -534,4 +534,6 @@ m.redraw = function()
   screen.update()
 end
 
+mod.menu.register("gridproxy", m)
+
 return m
