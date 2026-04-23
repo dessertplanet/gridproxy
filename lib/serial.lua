@@ -19,6 +19,7 @@
 local norns_serial = require 'core/serial'
 
 local serial = {}
+local HANDLER_ID = "gridproxy"
 
 -- -------------------------------------------------------------------
 -- State
@@ -50,18 +51,43 @@ function serial.setup()
   if state.setup_done then return end
   state.setup_done = true
 
+  -- Defensive guard: some norns builds can emit serial callbacks with
+  -- stale/unknown handler ids, which throws inside core/serial.lua and
+  -- can wedge matron. Wrap and ignore those specific failures.
+  if _norns and _norns.serial and _norns.serial.event and not serial._event_guarded then
+    local original_event = _norns.serial.event
+    _norns.serial.event = function(handler_id, id, data)
+      local ok, err = pcall(original_event, handler_id, id, data)
+      if not ok then
+        local msg = tostring(err)
+        if msg:find("/lua/core/serial.lua:112", 1, true) then
+          return
+        end
+        print("gridproxy/serial: event error: " .. msg)
+      end
+    end
+    serial._event_guarded = true
+  end
+
   norns_serial.add_handler({
-    id = "gridproxy",
+    id = HANDLER_ID,
 
     match = function(attrs)
-      -- Match any CDC ACM device. The Workshop Computer / RP2040
-      -- typically shows as vendor "Raspberry_Pi" or similar.
-      -- CDC ACM devices that don't match other handlers will land here.
-      -- Accept all — the user selects which port via the mod menu.
-      --
-      -- For now, accept broad: any device that presents a serial port.
-      -- If this is too greedy, narrow to specific VID/PID later.
-      return true
+      -- Restrict matching to the Workshop Computer firmware USB identity.
+      -- This avoids stealing unrelated serial devices and reduces callback churn.
+      local vendor = string.lower(attrs.vendor or "")
+      local model  = string.lower(attrs.model or "")
+      local iface  = string.lower(attrs.interface or "")
+
+      if model:find("mlrws", 1, true) then return true end
+      if model:find("workshop", 1, true) then return true end
+
+      -- fallback for Pico-style descriptors on primary data interface
+      if vendor:find("raspberry", 1, true) and (iface == "00" or iface == "01") then
+        return true
+      end
+
+      return false
     end,
 
     configure = function(term)
