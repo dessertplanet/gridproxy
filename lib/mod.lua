@@ -73,6 +73,13 @@ local _original_grid_connect = nil
 -- Grid lock: prevent scripts from stealing the grid while bridge is active
 -- -------------------------------------------------------------------
 
+-- -------------------------------------------------------------------
+-- Grid lock: prevent scripts from stealing the grid while bridge is active.
+-- We patch both grid.connect (returns dummy) AND the vport's output
+-- methods (led/all/refresh) so scripts with existing references can't
+-- flicker the display.
+-- -------------------------------------------------------------------
+
 local _dummy_grid = {
   name = "gridproxy (locked)",
   cols = 0,
@@ -89,20 +96,63 @@ local _dummy_grid = {
   tilt = nil,
 }
 
+-- When true, grid output methods are allowed (only set during our refresh_grid)
+local _grid_output_allowed = false
+
+-- Saved original vport methods
+local _saved_vport_methods = {}
+
 grid_lock = function()
   if _original_grid_connect then return end  -- already locked
+
+  -- 1) Patch grid.connect to return dummy
   _original_grid_connect = grid.connect
   grid.connect = function(n)
-    -- return a dummy device so scripts don't error, but can't use the grid
     return _dummy_grid
+  end
+
+  -- 2) Patch all vport output methods so only gridproxy can write
+  for i = 1, 4 do
+    local vp = grid.vports[i]
+    if vp then
+      _saved_vport_methods[i] = {
+        led = vp.led,
+        all = vp.all,
+        refresh = vp.refresh,
+      }
+      local orig_led = vp.led
+      local orig_all = vp.all
+      local orig_refresh = vp.refresh
+      vp.led = function(self, ...)
+        if _grid_output_allowed then return orig_led(self, ...) end
+      end
+      vp.all = function(self, ...)
+        if _grid_output_allowed then return orig_all(self, ...) end
+      end
+      vp.refresh = function(self, ...)
+        if _grid_output_allowed then return orig_refresh(self, ...) end
+      end
+    end
   end
 end
 
 grid_unlock = function()
+  -- Restore grid.connect
   if _original_grid_connect then
     grid.connect = _original_grid_connect
     _original_grid_connect = nil
   end
+
+  -- Restore vport output methods
+  for i = 1, 4 do
+    local vp = grid.vports[i]
+    if vp and _saved_vport_methods[i] then
+      vp.led = _saved_vport_methods[i].led
+      vp.all = _saved_vport_methods[i].all
+      vp.refresh = _saved_vport_methods[i].refresh
+    end
+  end
+  _saved_vport_methods = {}
 end
 
 -- -------------------------------------------------------------------
@@ -165,6 +215,9 @@ refresh_grid = function()
   local g = state.grid_dev
   if not g then return end
 
+  -- Allow our output through the vport gate
+  _grid_output_allowed = true
+
   -- LED buffer is 0-based (mext coords); grid:led() is 1-based
   for y = 0, state.grid_rows - 1 do
     for x = 0, state.grid_cols - 1 do
@@ -172,6 +225,8 @@ refresh_grid = function()
     end
   end
   g:refresh()
+
+  _grid_output_allowed = false
 end
 
 -- -------------------------------------------------------------------
@@ -243,8 +298,10 @@ end
 grid_disconnect = function()
   if state.grid_dev then
     pcall(function()
+      _grid_output_allowed = true
       state.grid_dev:all(0)
       state.grid_dev:refresh()
+      _grid_output_allowed = false
     end)
     state.grid_dev.key = nil
     state.grid_dev = nil
@@ -299,8 +356,10 @@ start_bridge = function()
     clear_leds()
     if state.grid_dev then
       pcall(function()
+        _grid_output_allowed = true
         state.grid_dev:all(0)
         state.grid_dev:refresh()
+        _grid_output_allowed = false
       end)
     end
     mod.menu.redraw()
