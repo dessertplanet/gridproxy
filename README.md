@@ -60,7 +60,3 @@ lib/
   mext.lua   — mext protocol encoder/decoder
   serial.lua — serial port abstraction (luaposix)
 ```
-
-## License
-
-MIT
