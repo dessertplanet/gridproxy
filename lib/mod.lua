@@ -77,12 +77,16 @@ local _dummy_grid = {
   name = "gridproxy (locked)",
   cols = 0,
   rows = 0,
+  port = 0,
   device = nil,
   key = function() end,
   led = function() end,
   all = function() end,
   refresh = function() end,
   intensity = function() end,
+  rotation = function() end,
+  tilt_enable = function() end,
+  tilt = nil,
 }
 
 grid_lock = function()
