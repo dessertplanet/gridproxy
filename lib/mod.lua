@@ -332,6 +332,22 @@ mod.hook.register("system_post_startup", "gridproxy", function()
   serial.setup()
 end)
 
+-- Re-capture the grid after any script loads (scripts may call
+-- grid.connect() which overwrites our key callback).
+mod.hook.register("script_post_init", "gridproxy_grid_recapture", function()
+  if state.active then
+    grid_connect()
+  end
+end)
+
+-- Also re-capture after script cleanup, in case the outgoing script
+-- released or reset the grid device.
+mod.hook.register("script_post_cleanup", "gridproxy_grid_recapture_cleanup", function()
+  if state.active then
+    grid_connect()
+  end
+end)
+
 -- -------------------------------------------------------------------
 -- Mod menu page
 -- -------------------------------------------------------------------
