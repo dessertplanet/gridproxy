@@ -110,11 +110,11 @@ handle_discovery = function(query_byte)
   if not serial.is_connected() then return end
 
   if query_byte == mext.SYS_QUERY then
-    serial.write(mext.encode_query_response())
+    serial.write(mext.pad64(mext.encode_query_response()))
   elseif query_byte == mext.SYS_ID then
-    serial.write(mext.encode_id("gridproxy"))
+    serial.write(mext.pad64(mext.encode_id("gridproxy")))
   elseif query_byte == mext.SYS_SIZE_REQ then
-    serial.write(mext.encode_grid_size(state.grid_cols, state.grid_rows))
+    serial.write(mext.pad64(mext.encode_grid_size(state.grid_cols, state.grid_rows)))
   end
 end
 
@@ -277,6 +277,16 @@ start_bridge = function()
 
   -- register serial handler (auto-detects CDC ACM devices)
   serial.setup()
+
+  -- If serial was already connected before bridge start, reflect that now.
+  if serial.is_connected() then
+    state.serial_connected = true
+    state.serial_name = serial.device_name() or "?"
+    print("gridproxy: serial already connected — " .. state.serial_name)
+  else
+    state.serial_connected = false
+    state.serial_name = nil
+  end
 
   -- capture grid if already present
   grid_connect()
